@@ -55,7 +55,7 @@ Endpoints are installation-specific and are not permanent identities:
 
 ## 3. Read-only baseline
 
-From the controller directory:
+From the bundled `scripts/` directory, or from a controller directory explicitly supplied by the user:
 
 ```powershell
 python sdg2122x_control.py --host <generator-ip> idn

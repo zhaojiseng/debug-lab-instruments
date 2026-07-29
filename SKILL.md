@@ -1,11 +1,11 @@
 ---
 name: debug-lab-instruments
-description: Control and debug a SIGLENT SDG2122X or compatible SDG generator together with a RIGOL DHO924, MHO934, or compatible DHO800/DHO900/MHO900 oscilloscope through terminal-only Python LAN-SCPI controllers named sdg2122x_control.py and dho924_control.py. Use for device discovery, dynamic-IP recovery, connection testing, status inspection, generator or MHO AFG waveform/output control, oscilloscope channel/acquisition/timebase/trigger/measurement control, waveform or screenshot capture, DHO waveform-preview -200 errors, SCPI troubleshooting, simulated regression testing, and coordinated bench signal-chain debugging.
+description: Control and debug a SIGLENT SDG2122X or compatible SDG generator together with a RIGOL DHO924, MHO934, or compatible DHO800/DHO900/MHO900 oscilloscope through bundled terminal-only Python LAN-SCPI controllers. Use for device discovery, dynamic-IP recovery, connection testing, status inspection, generator or MHO AFG waveform/output control, oscilloscope channel/acquisition/timebase/trigger/measurement control, waveform or screenshot capture, DHO waveform-preview -200 errors, SCPI troubleshooting, simulated regression testing, and coordinated bench signal-chain debugging.
 ---
 
 # Debug Lab Instruments
 
-Use the existing terminal-only controllers in the user's workspace. Keep real-device work deliberate, observable, and reversible.
+Use the bundled terminal-only controllers under `scripts/` unless the user explicitly supplies a project copy. Keep real-device work deliberate, observable, and reversible.
 
 ## Route references
 
@@ -19,14 +19,18 @@ Then read only the device references needed:
 
 ## Locate the controllers
 
-Locate these files in the current workspace or use the controller directory explicitly supplied by the user:
+Resolve these bundled files relative to this `SKILL.md`:
 
 ```text
-sdg2122x_control.py
-dho924_control.py
+scripts/sdg2122x_control.py
+scripts/dho924_control.py
+scripts/test_sdg2122x_control.py
+scripts/test_dho924_control.py
 ```
 
-Do not assume a fixed drive letter or home directory. Run commands from the directory containing the controllers. Use Python 3.10+ and the current terminal; do not open a separate GUI window.
+Run commands from `scripts/`. If the user supplies another controller project, use that copy and run its tests instead. Use Python 3.10+ and the current terminal; do not open a separate GUI window.
+
+The public bundled controllers use RFC 5737 TEST-NET addresses as harmless defaults. Treat them only as placeholders; use an explicit user IP, a cached device, or manual discovery for real instruments.
 
 ## Classify the requested action
 
