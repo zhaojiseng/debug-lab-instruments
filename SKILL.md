@@ -1,6 +1,6 @@
 ---
 name: debug-lab-instruments
-description: Control and debug a SIGLENT SDG2122X or compatible SDG generator together with a RIGOL DHO924, MHO934, or compatible DHO800/DHO900/MHO900 oscilloscope through bundled terminal-only Python LAN-SCPI controllers. Use for device discovery, dynamic-IP recovery, connection testing, status inspection, generator or MHO AFG waveform/output control, oscilloscope channel/acquisition/timebase/trigger/measurement control, waveform or screenshot capture, DHO waveform-preview -200 errors, SCPI troubleshooting, simulated regression testing, and coordinated bench signal-chain debugging.
+description: Control and debug a model-profiled SIGLENT SDG1032X, SDG2122X, or compatible SDG generator together with a RIGOL DHO924, MHO934, or compatible DHO800/DHO900/MHO900 oscilloscope through bundled terminal-only Python LAN-SCPI controllers. Use for device discovery, dynamic-IP recovery, connection testing, status inspection, SDG model-limit validation, generator or MHO AFG waveform/output control, oscilloscope channel/acquisition/timebase/trigger/measurement control, waveform or screenshot capture, DHO waveform-preview -200 errors, SCPI troubleshooting, simulated regression testing, and coordinated bench signal-chain debugging.
 ---
 
 # Debug Lab Instruments
@@ -65,7 +65,7 @@ Remember that both instruments may use DHCP. Treat documented IPs as current def
 ## Execute a single-instrument task
 
 1. Run `idn` first unless a valid identity was just obtained in the same session.
-2. Confirm that the selected identity matches the command family.
+2. Confirm that the selected identity matches the command family and inspect the SDG model profile before generator writes.
 3. Read the relevant current state.
 4. Apply the smallest requested change.
 5. Read back the actual target channel or subsystem.
@@ -127,7 +127,9 @@ python -m unittest -v test_dho924_control.py
 - Restrict non-DHO800/DHO900/MHO900 devices to generic SCPI when using the scope controller.
 - Do not expose DHO924S-only AFG or Bode functions as DHO924 features.
 - Expose MHO900 AFG functions only after confirming the model and installed AFG option; treat AFG output ON as a physical output action.
-- Do not expose SDG7000A-only features as SDG2122X features.
+- For SDG1032X, enforce 30 MHz SINE/SQUARE, 12.5 MHz PULSE, 500 kHz RAMP, 6 MHz DDS ARB, and 16 kpts arbitrary-memory limits.
+- Do not send `NOISE_ADD`, `MSW`, `SRATE`, `CASCADE`, `COUP TRDUCH`, `POWER:ON:MODE`, or `KEY` to SDG1032X through structured APIs.
+- Do not expose SDG7000A-only features as SDG1032X or SDG2122X features.
 - Use the official command manuals and the project protocol documents before experimental raw writes.
 
 ## Report results

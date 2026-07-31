@@ -8,12 +8,16 @@ from pathlib import Path
 from sdg2122x_control import (
     DiscoveredInstrument,
     DiscoveryProgress,
+    InstrumentCommandError,
     SDG2122X,
+    SDGModelProfile,
     SDGTerminalApp,
+    SineConfiguration,
     TerminalEvent,
     TerminalSession,
     choose_console_device,
     discover_instruments,
+    get_sdg_model_profile,
     is_siglent_sdg_identity,
     load_last_device,
     locate_instrument,
@@ -42,6 +46,12 @@ class FakeInstrumentHandler(socketserver.StreamRequestHandler):
 
     def apply_write(self, command):
         upper = command.upper()
+        if upper.startswith("OUT_BOTHCH "):
+            state = upper.split(None, 1)[1]
+            if state in {"ON", "OFF"}:
+                with self.server.state_lock:
+                    self.server.output_states = {1: state, 2: state}
+            return
         if upper.startswith(("C1:OUTP ", "C2:OUTP ")):
             channel = int(upper[1])
             state = upper.split(None, 1)[1].split(",", 1)[0]
@@ -205,7 +215,7 @@ class HelperTests(unittest.TestCase):
         candidate = DiscoveredInstrument(
             "192.0.2.213",
             5025,
-            "Siglent Technologies,SDG2122X,PUBLIC-SERIAL-001,2.01.01.35R3B2",
+            "Siglent Technologies,SDG2122X,TEST-SERIAL,2.01.01.35R3B2",
         )
         self.assertTrue(candidate.display_name().startswith("SDG2122X"))
         self.assertIn("192.0.2.213:5025", candidate.display_name())
@@ -238,6 +248,27 @@ class HelperTests(unittest.TestCase):
             is_siglent_sdg_identity("Siglent Technologies,SDG1032X,TEST0002,1.0")
         )
         self.assertFalse(is_siglent_sdg_identity("Acme Instruments,SCOPE1000,A001,1.0"))
+
+    def test_sdg1032x_profile_uses_official_model_limits(self):
+        profile = get_sdg_model_profile(
+            "Siglent Technologies,SDG1032X,TEST0002,1.0"
+        )
+        self.assertIsInstance(profile, SDGModelProfile)
+        assert profile is not None
+        self.assertEqual(profile.model, "SDG1032X")
+        self.assertEqual(profile.family, "SDG1000X")
+        self.assertEqual(profile.frequency_limit("SINE"), 30_000_000)
+        self.assertEqual(profile.frequency_limit("SQUARE"), 30_000_000)
+        self.assertEqual(profile.frequency_limit("PULSE"), 12_500_000)
+        self.assertEqual(profile.frequency_limit("RAMP"), 500_000)
+        self.assertEqual(profile.frequency_limit("ARB"), 6_000_000)
+        self.assertEqual(profile.max_arbitrary_points, 16_384)
+        self.assertFalse(profile.supports("sample_rate"))
+        self.assertFalse(profile.supports("cascade"))
+        self.assertFalse(profile.supports("noise_add"))
+        self.assertTrue(profile.supports("harmonic"))
+        self.assertTrue(profile.supports("combine"))
+        self.assertTrue(profile.supports("frequency_counter"))
 
 
 class InstrumentApiTests(unittest.TestCase):
@@ -294,6 +325,101 @@ class InstrumentApiTests(unittest.TestCase):
             device.upload_waveform_samples(1, "test", [-1.0, 0.0, 1.0])
         command = next(cmd for cmd in self.server.commands if ":WVDT " in cmd)
         self.assertIn("800100007fff", command)
+
+    def test_sdg1032x_enforces_frequency_and_waveform_memory_limits(self):
+        self.server.identity = "Siglent Technologies,SDG1032X,TEST1032,1.01.01"
+        with self.device() as device:
+            device.identify()
+            device.set_sine(SineConfiguration(1, 30_000_000, 1.0))
+            with self.assertRaisesRegex(ValueError, "SDG1032X.*30 MHz"):
+                device.set_sine(SineConfiguration(1, 30_000_001, 1.0))
+            with self.assertRaisesRegex(ValueError, "PULSE.*12.5 MHz"):
+                device.set_basic_wave(
+                    1, [("WVTP", "PULSE"), ("FRQ", 12_500_001)]
+                )
+            with self.assertRaisesRegex(ValueError, "30 MHz"):
+                device.set_channel_tokens(
+                    1, "MDWV", ("CARR", "FRQ", 30_000_001)
+                )
+            with self.assertRaisesRegex(ValueError, "Sweep STOP.*30 MHz"):
+                device.set_sweep(1, [("START", 100), ("STOP", 30_000_001)])
+            with self.assertRaisesRegex(ValueError, "16384"):
+                device.upload_waveform_samples(1, "too_long", [0.0] * 16_385)
+
+        commands = "\n".join(self.server.commands)
+        self.assertIn("C1:BSWV WVTP,SINE,FRQ,30000000", commands)
+        self.assertNotIn("FRQ,30000001", commands)
+        self.assertNotIn("FRQ,12500001", commands)
+        self.assertNotIn("CARR,FRQ,30000001", commands)
+        self.assertNotIn("STOP,30000001", commands)
+        self.assertNotIn("too_long", commands)
+
+    def test_sdg1032x_blocks_unsupported_command_families(self):
+        self.server.identity = "Siglent Technologies,SDG1032X,TEST1032,1.01.01"
+        with self.device() as device:
+            device.identify()
+            unsupported = (
+                lambda: device.set_sample_rate(1, mode="TARB"),
+                lambda: device.set_cascade(True),
+                lambda: device.set_noise_add(1, True, ratio=20),
+                lambda: device.set_arbitrary_marker(1, True),
+            )
+            for callback in unsupported:
+                with self.assertRaises(InstrumentCommandError):
+                    callback()
+
+        commands = "\n".join(self.server.commands)
+        self.assertNotIn(":SRATE ", commands)
+        self.assertNotIn("CASCADE ", commands)
+        self.assertNotIn("NOISE_ADD ", commands)
+        self.assertNotIn(":MSW ", commands)
+
+    def test_sdg1032x_keeps_supported_major_functions(self):
+        self.server.identity = "Siglent Technologies,SDG1032X,TEST1032,1.01.01"
+        with self.device() as device:
+            device.identify()
+            device.set_modulation(1, "AM", [("STATE", True)])
+            device.set_sweep(1, [("STATE", True), ("START", 100), ("STOP", 1000)])
+            device.set_burst(1, [("STATE", True), ("TIME", 5)])
+            device.set_harmonic(1, [("HARMSTATE", True), ("HARMORDER", 2)])
+            device.set_combine(1, True)
+            device.set_frequency_counter([("STATE", True)])
+            output_1, output_2 = device.set_all_outputs(True)
+            self.assertIn("OUTP ON", output_1)
+            self.assertIn("OUTP ON", output_2)
+
+        commands = "\n".join(self.server.commands)
+        self.assertIn("C1:MDWV AM,STATE,ON", commands)
+        self.assertIn("C1:SWWV STATE,ON,START,100,STOP,1000", commands)
+        self.assertIn("C1:BTWV STATE,ON,TIME,5", commands)
+        self.assertIn("C1:HARM HARMSTATE,ON,HARMORDER,2", commands)
+        self.assertIn("C1:CMBN ON", commands)
+        self.assertIn("FCNT STATE,ON", commands)
+        self.assertIn("OUT_BOTHCH ON", commands)
+
+    def test_sdg1032x_tui_hides_unsupported_actions(self):
+        self.server.identity = "Siglent Technologies,SDG1032X,TEST1032,1.01.01"
+        app = SDGTerminalApp(self.host, self.port, 1.0, cache_path=None)
+        app.instrument.connect()
+        app._refresh_all()
+
+        channel_labels = {action.label for action in app._channel_actions()}
+        arbitrary_labels = {action.label for action in app._arbitrary_actions()}
+        advanced_labels = {action.label for action in app._advanced_actions()}
+        system_labels = {action.label for action in app._system_actions()}
+
+        self.assertNotIn("采样模式 DDS/TARB", channel_labels)
+        self.assertNotIn("TrueArb 采样率", channel_labels)
+        self.assertNotIn("任意波 Marker 开关", arbitrary_labels)
+        self.assertNotIn("查询多机同步", advanced_labels)
+        self.assertNotIn("设置多机同步", advanced_labels)
+        self.assertNotIn("噪声叠加 NOISE_ADD", system_labels)
+        self.assertNotIn("直接上电开机模式", system_labels)
+        self.assertNotIn("前面板按键开关", system_labels)
+        self.assertIn("查询谐波参数", advanced_labels)
+        self.assertIn("波形合并开关", advanced_labels)
+        self.assertIn("SDG1032X", app._channel_summary_lines(120)[0])
+        app.instrument.close()
 
     def test_tui_catalog_contains_all_major_sections(self):
         app = SDGTerminalApp(self.host, self.port, 1.0, cache_path=None)

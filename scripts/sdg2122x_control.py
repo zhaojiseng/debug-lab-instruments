@@ -6,6 +6,8 @@ tries the last successfully identified device, then scans local IPv4 networks.
 Discovery accepts any instrument that answers *IDN?; SDG-specific menus are
 enabled for SIGLENT SDG models.
 
+Known model profiles currently include SDG1032X/SDG1000X and SDG2122X/SDG2000X.
+
 Examples:
     python sdg2122x_control.py discover
     python sdg2122x_control.py idn
@@ -123,6 +125,160 @@ def is_siglent_sdg_identity(identity: str) -> bool:
     if len(parts) < 2:
         return False
     return "SIGLENT" in parts[0] and parts[1].startswith("SDG")
+
+
+SDG_PROFILED_FEATURES = frozenset(
+    {
+        "arbitrary_marker",
+        "cascade",
+        "combine",
+        "coupling",
+        "frequency_counter",
+        "front_panel_keys",
+        "harmonic",
+        "manual_trigger_coupling",
+        "noise_add",
+        "phase_mode",
+        "power_on_mode",
+        "sample_rate",
+    }
+)
+
+
+@dataclass(frozen=True)
+class SDGModelProfile:
+    """Model-specific limits and command-family availability for a SIGLENT SDG."""
+
+    model: str
+    family: str
+    frequency_limits_hz: tuple[tuple[str, float], ...] = ()
+    max_arbitrary_points: int | None = None
+    arbitrary_index_range: tuple[int, int] | None = None
+    supported_features: frozenset[str] = SDG_PROFILED_FEATURES
+    languages: tuple[str, ...] = ("EN", "CH", "RU")
+    documented: bool = False
+
+    def frequency_limit(self, waveform: str) -> float | None:
+        aliases = {
+            "ARBITRARY": "ARB",
+            "PULS": "PULSE",
+            "SQU": "SQUARE",
+            "TRIANGLE": "RAMP",
+        }
+        name = aliases.get(waveform.strip().upper(), waveform.strip().upper())
+        for candidate, limit in self.frequency_limits_hz:
+            if candidate == name:
+                return limit
+        return None
+
+    def supports(self, feature: str) -> bool:
+        return feature.strip().lower() in self.supported_features
+
+    def summary(self) -> str:
+        sine_limit = self.frequency_limit("SINE")
+        limit = f"，正弦≤{format_frequency_limit(sine_limit)}" if sine_limit else ""
+        source = "官方型号档案" if self.documented else "通用兼容档案"
+        return f"{self.model} / {self.family}{limit} / {source}"
+
+
+def format_frequency_limit(value: float | None) -> str:
+    if value is None:
+        return "未知"
+    for scale, suffix in ((1e9, "GHz"), (1e6, "MHz"), (1e3, "kHz")):
+        if value >= scale:
+            number = value / scale
+            return f"{number:g} {suffix}"
+    return f"{value:g} Hz"
+
+
+_SDG1000X_FEATURES = SDG_PROFILED_FEATURES - {
+    "arbitrary_marker",
+    "cascade",
+    "front_panel_keys",
+    "manual_trigger_coupling",
+    "noise_add",
+    "power_on_mode",
+    "sample_rate",
+}
+_SDG2000X_FEATURES = SDG_PROFILED_FEATURES - {
+    "arbitrary_marker",
+    "front_panel_keys",
+    "noise_add",
+    "power_on_mode",
+}
+
+
+def _sdg1000x_profile(model: str, sine_square_limit: float) -> SDGModelProfile:
+    return SDGModelProfile(
+        model=model,
+        family="SDG1000X",
+        frequency_limits_hz=(
+            ("SINE", sine_square_limit),
+            ("SQUARE", sine_square_limit),
+            ("PULSE", 12.5e6),
+            ("RAMP", 500e3),
+            ("ARB", 6e6),
+        ),
+        max_arbitrary_points=16_384,
+        arbitrary_index_range=(2, 198),
+        supported_features=_SDG1000X_FEATURES,
+        languages=("EN", "CH"),
+        documented=True,
+    )
+
+
+SDG_MODEL_PROFILES: dict[str, SDGModelProfile] = {
+    "SDG1022X": _sdg1000x_profile("SDG1022X", 25e6),
+    "SDG1032X": _sdg1000x_profile("SDG1032X", 30e6),
+    "SDG1062X": _sdg1000x_profile("SDG1062X", 60e6),
+    "SDG2122X": SDGModelProfile(
+        model="SDG2122X",
+        family="SDG2000X",
+        frequency_limits_hz=(("SINE", 120e6),),
+        arbitrary_index_range=(2, 198),
+        supported_features=_SDG2000X_FEATURES,
+        languages=("EN", "CH"),
+        documented=True,
+    ),
+}
+
+
+def get_sdg_model_profile(identity_or_model: str) -> SDGModelProfile | None:
+    """Return a known or family-level profile from an IDN response or model name."""
+    value = identity_or_model.strip()
+    if not value:
+        return None
+    if "," in value:
+        if not is_siglent_sdg_identity(value):
+            return None
+        parts = [part.strip() for part in value.split(",")]
+        model = parts[1].upper()
+    else:
+        model = value.upper()
+        if not model.startswith("SDG"):
+            return None
+
+    known = SDG_MODEL_PROFILES.get(model)
+    if known is not None:
+        return known
+    if re.fullmatch(r"SDG10\d{2}X(?:-E)?", model):
+        return SDGModelProfile(
+            model=model,
+            family="SDG1000X",
+            max_arbitrary_points=16_384,
+            arbitrary_index_range=(2, 198),
+            supported_features=_SDG1000X_FEATURES,
+            languages=("EN", "CH"),
+        )
+    if re.fullmatch(r"SDG2\d{3}X(?:-E)?", model):
+        return SDGModelProfile(
+            model=model,
+            family="SDG2000X",
+            arbitrary_index_range=(2, 198),
+            supported_features=_SDG2000X_FEATURES,
+            languages=("EN", "CH"),
+        )
+    return SDGModelProfile(model=model, family="SIGLENT SDG")
 
 
 def instrument_identity_key(identity: str) -> tuple[str, ...]:
@@ -632,10 +788,17 @@ class SineConfiguration:
     offset_v: float = 0.0
     phase_deg: float = 0.0
 
-    def validate(self) -> None:
+    def validate(
+        self,
+        max_frequency_hz: float = 120e6,
+        model: str = "SIGLENT SDG",
+    ) -> None:
         validate_channel(self.channel)
-        if not 1e-6 <= self.frequency_hz <= 120e6:
-            raise ValueError("Frequency must be between 1 uHz and 120 MHz")
+        if not 1e-6 <= self.frequency_hz <= max_frequency_hz:
+            raise ValueError(
+                f"{model} SINE frequency must be between 1 uHz and "
+                f"{format_frequency_limit(max_frequency_hz)}"
+            )
         if not 0.0 < self.amplitude_vpp <= 20.0:
             raise ValueError("Amplitude must be greater than 0 and at most 20 Vpp")
         if not -10.0 <= self.offset_v <= 10.0:
@@ -645,7 +808,7 @@ class SineConfiguration:
 
 
 class SDG2122X:
-    """Minimal SCPI client for the SIGLENT SDG2122X."""
+    """LAN SCPI client for supported SIGLENT SDG generators."""
 
     def __init__(
         self,
@@ -659,6 +822,11 @@ class SDG2122X:
         self._socket: socket.socket | None = None
         self._receive_buffer = bytearray()
         self._lock = threading.RLock()
+        self.identity: str | None = None
+        self.model_profile = SDGModelProfile(
+            model="未知 SDG",
+            family="SIGLENT SDG",
+        )
 
     def connect(self) -> "SDG2122X":
         with self._lock:
@@ -736,7 +904,151 @@ class SDG2122X:
             return self._read_line()
 
     def identify(self) -> str:
-        return self.query("*IDN?")
+        identity = self.query("*IDN?")
+        self.identity = identity
+        profile = get_sdg_model_profile(identity)
+        if profile is not None:
+            self.model_profile = profile
+        return identity
+
+    def _ensure_model_profile(self) -> SDGModelProfile:
+        if self.identity is None:
+            self.identify()
+        assert self.identity is not None
+        profile = get_sdg_model_profile(self.identity)
+        if profile is None:
+            raise InstrumentCommandError(
+                f"{self.identity!r} is not a recognized SIGLENT SDG generator"
+            )
+        self.model_profile = profile
+        return profile
+
+    def _require_feature(self, feature: str, command_family: str) -> SDGModelProfile:
+        profile = self._ensure_model_profile()
+        if not profile.supports(feature):
+            raise InstrumentCommandError(
+                f"{profile.model} ({profile.family}) does not support "
+                f"{command_family} through its documented SCPI command set"
+            )
+        return profile
+
+    @staticmethod
+    def _frequency_value(value: Any) -> float | None:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        text = str(value).strip()
+        text = re.sub(r"(?i)\s*HZ\s*$", "", text)
+        try:
+            return parse_engineering_number(text)
+        except argparse.ArgumentTypeError:
+            return None
+
+    @staticmethod
+    def _validate_waveform_frequency(
+        profile: SDGModelProfile,
+        waveform: str,
+        frequency_hz: float,
+    ) -> None:
+        limit = profile.frequency_limit(waveform)
+        if limit is None:
+            return
+        if not 1e-6 <= frequency_hz <= limit:
+            name = waveform.strip().upper()
+            raise ValueError(
+                f"{profile.model} {name} frequency must be between 1 uHz and "
+                f"{format_frequency_limit(limit)}"
+            )
+
+    @staticmethod
+    def _response_parameter(response: str, parameter: str) -> str | None:
+        payload = response.split(" ", 1)[1] if " " in response else response
+        tokens = [token.strip() for token in payload.split(",")]
+        target = parameter.strip().upper()
+        for index, token in enumerate(tokens[:-1]):
+            if token.upper() == target:
+                return tokens[index + 1]
+        return None
+
+    def _current_waveform_context(
+        self, channel: int, header: str = "BSWV"
+    ) -> tuple[str, float | None]:
+        response = self.query_channel(channel, header)
+        waveform = self._response_parameter(response, "WVTP")
+        frequency = self._response_parameter(response, "FRQ")
+        if not waveform or frequency is None:
+            basic = self.basic_waveform(channel) if header != "BSWV" else response
+            waveform = waveform or self._response_parameter(basic, "WVTP")
+            frequency = frequency or self._response_parameter(basic, "FRQ")
+        return waveform or "SINE", self._frequency_value(frequency) if frequency else None
+
+    def _validate_basic_parameters(
+        self,
+        channel: int,
+        items: Sequence[tuple[str, Any]],
+    ) -> None:
+        normalized = {str(name).strip().upper(): value for name, value in items}
+        if not {"WVTP", "FRQ"}.intersection(normalized):
+            return
+        profile = self._ensure_model_profile()
+        current_waveform, current_frequency = self._current_waveform_context(channel)
+        waveform = str(normalized.get("WVTP", current_waveform))
+        frequency = self._frequency_value(normalized.get("FRQ"))
+        if frequency is None:
+            frequency = current_frequency
+        if frequency is not None:
+            self._validate_waveform_frequency(profile, waveform, frequency)
+
+    def _validate_carrier_tokens(
+        self,
+        channel: int,
+        header: str,
+        tokens: Sequence[Any],
+    ) -> None:
+        names = [str(token).strip() for token in tokens]
+        upper = [token.upper() for token in names]
+        if "CARR" not in upper or not {"WVTP", "FRQ"}.intersection(upper):
+            return
+        profile = self._ensure_model_profile()
+        current_waveform, current_frequency = self._current_waveform_context(
+            channel, header
+        )
+
+        def value_after(parameter: str) -> Any | None:
+            try:
+                index = upper.index(parameter)
+            except ValueError:
+                return None
+            return tokens[index + 1] if index + 1 < len(tokens) else None
+
+        waveform = str(value_after("WVTP") or current_waveform)
+        frequency = self._frequency_value(value_after("FRQ"))
+        if frequency is None:
+            frequency = current_frequency
+        if frequency is not None:
+            self._validate_waveform_frequency(profile, waveform, frequency)
+
+    def _validate_sweep_frequencies(
+        self,
+        channel: int,
+        items: Sequence[tuple[str, Any]],
+    ) -> None:
+        frequency_parameters = {"START", "STOP", "CENTER"}
+        requested = [
+            (str(name).strip().upper(), value)
+            for name, value in items
+            if str(name).strip().upper() in frequency_parameters
+        ]
+        if not requested:
+            return
+        profile = self._ensure_model_profile()
+        waveform, _ = self._current_waveform_context(channel, "SWWV")
+        for name, value in requested:
+            frequency = self._frequency_value(value)
+            if frequency is not None:
+                try:
+                    self._validate_waveform_frequency(profile, waveform, frequency)
+                except ValueError as exc:
+                    raise ValueError(f"Sweep {name}: {exc}") from exc
 
     def operation_complete(self) -> bool:
         return self.query("*OPC?") == "1"
@@ -758,8 +1070,16 @@ class SDG2122X:
         self.write(f"C{channel}:OUTP {state}")
         return self.output_status(channel)
 
+    def set_all_outputs(self, enabled: bool) -> tuple[str, str]:
+        """Set both channel outputs with the shared SDG command and verify each channel."""
+        self._ensure_model_profile()
+        self.write(f"OUT_BOTHCH {'ON' if enabled else 'OFF'}")
+        return self.output_status(1), self.output_status(2)
+
     def set_sine(self, configuration: SineConfiguration) -> str:
-        configuration.validate()
+        profile = self._ensure_model_profile()
+        maximum = profile.frequency_limit("SINE") or 120e6
+        configuration.validate(maximum, profile.model)
         channel = configuration.channel
         command = (
             f"C{channel}:BSWV "
@@ -793,7 +1113,10 @@ class SDG2122X:
         if not tokens:
             raise ValueError("At least one SCPI token is required")
         header = header.strip().upper()
-        payload = ",".join(scpi_value(token) for token in tokens)
+        token_items = list(tokens)
+        if header in {"MDWV", "SWWV", "BTWV"}:
+            self._validate_carrier_tokens(channel, header, token_items)
+        payload = ",".join(scpi_value(token) for token in token_items)
         self.write(f"C{channel}:{header} {payload}")
         return self.query_channel(channel, header) if verify else None
 
@@ -807,7 +1130,19 @@ class SDG2122X:
     ) -> str | None:
         validate_channel(channel)
         header = header.strip().upper()
-        self.write(f"C{channel}:{header} {scpi_pairs(parameters)}")
+        items = list(parameters.items()) if isinstance(parameters, Mapping) else list(parameters)
+        if header == "BSWV":
+            self._validate_basic_parameters(channel, items)
+        elif header == "SWWV":
+            self._validate_sweep_frequencies(channel, items)
+        feature_headers = {
+            "HARM": ("harmonic", "HARM"),
+            "CMBN": ("combine", "CMBN"),
+            "SRATE": ("sample_rate", "SRATE"),
+        }
+        if header in feature_headers:
+            self._require_feature(*feature_headers[header])
+        self.write(f"C{channel}:{header} {scpi_pairs(items)}")
         return self.query_channel(channel, header) if verify else None
 
     def query_global(self, header: str) -> str:
@@ -871,6 +1206,7 @@ class SDG2122X:
         ratio_db: float | None = None,
     ) -> str:
         validate_channel(channel)
+        self._require_feature("noise_add", "NOISE_ADD")
         parameters: list[tuple[str, Any]] = [("STATE", enabled)]
         if ratio is not None and ratio_db is not None:
             raise ValueError("Specify ratio or ratio_db, not both")
@@ -898,7 +1234,10 @@ class SDG2122X:
             modulation_type = modulation_type.strip().upper()
             allowed = {"AM", "DSBAM", "FM", "PM", "PWM", "ASK", "FSK", "PSK"}
             if modulation_type not in allowed:
-                raise ValueError(f"Unsupported SDG2122X modulation type: {modulation_type}")
+                profile = self._ensure_model_profile()
+                raise ValueError(
+                    f"Unsupported {profile.model} modulation type: {modulation_type}"
+                )
             parts.append(modulation_type)
         if parameters:
             parts.append(scpi_pairs(parameters))
@@ -962,10 +1301,18 @@ class SDG2122X:
         path: str | None = None,
     ) -> str:
         validate_channel(channel)
+        profile = self._ensure_model_profile()
         supplied = sum(value is not None for value in (index, name, path))
         if supplied != 1:
             raise ValueError("Specify exactly one of index, name, or path")
         if index is not None:
+            if profile.arbitrary_index_range is not None:
+                minimum, maximum = profile.arbitrary_index_range
+                if not minimum <= index <= maximum:
+                    raise ValueError(
+                        f"{profile.model} built-in arbitrary waveform index must be "
+                        f"between {minimum} and {maximum}"
+                    )
             command = f"C{channel}:ARWV INDEX,{index}"
         else:
             command = f"C{channel}:ARWV NAME,{scpi_quote(name or path or '')}"
@@ -974,6 +1321,7 @@ class SDG2122X:
 
     def set_arbitrary_marker(self, channel: int, enabled: bool) -> str:
         validate_channel(channel)
+        self._require_feature("arbitrary_marker", "arbitrary waveform Marker (MSW)")
         self.write(f"C{channel}:MSW {'ON' if enabled else 'OFF'}")
         self.operation_complete()
         return "ON" if enabled else "OFF"
@@ -990,9 +1338,19 @@ class SDG2122X:
 
     def upload_waveform_hex(self, channel: int, name: str, hex_data: str) -> None:
         validate_channel(channel)
+        profile = self._ensure_model_profile()
         clean = re.sub(r"[^0-9A-Fa-f]", "", hex_data)
         if not clean or len(clean) % 4:
             raise ValueError("Waveform hex data must contain complete 16-bit samples")
+        sample_count = len(clean) // 4
+        if (
+            profile.max_arbitrary_points is not None
+            and sample_count > profile.max_arbitrary_points
+        ):
+            raise ValueError(
+                f"{profile.model} arbitrary waveform memory accepts at most "
+                f"{profile.max_arbitrary_points} samples; received {sample_count}"
+            )
         self.write(
             f"C{channel}:WVDT WVNM,{scpi_quote(name)},WAVEDATA,b'0x{clean.lower()}'"
         )
@@ -1058,18 +1416,22 @@ class SDG2122X:
         self.write("EQPHASE")
 
     def coupling_status(self) -> str:
+        self._require_feature("coupling", "COUP")
         return self.query("COUP?")
 
     def set_coupling(
         self, parameters: Mapping[str, Any] | Sequence[tuple[str, Any]]
     ) -> str:
+        self._require_feature("coupling", "COUP")
         self.write(f"COUP {scpi_pairs(parameters)}")
         return self.coupling_status()
 
     def phase_mode(self) -> str:
+        self._require_feature("phase_mode", "MODE")
         return self.query("MODE?")
 
     def set_phase_mode(self, mode: str) -> str:
+        self._require_feature("phase_mode", "MODE")
         mode_value = mode.strip().upper()
         if mode_value not in {"PHASELOCKED", "INDEPENDENT"}:
             raise ValueError("Phase mode must be PHASELOCKED or INDEPENDENT")
@@ -1077,6 +1439,7 @@ class SDG2122X:
         return self.phase_mode()
 
     def cascade_status(self) -> str:
+        self._require_feature("cascade", "CASCADE")
         return self.query("CASCADE?")
 
     def set_cascade(
@@ -1086,6 +1449,7 @@ class SDG2122X:
         mode: str = "MASTER",
         delay_s: float | None = None,
     ) -> str:
+        self._require_feature("cascade", "CASCADE")
         mode_value = mode.strip().upper()
         if mode_value not in {"MASTER", "SLAVE"}:
             raise ValueError("Cascade mode must be MASTER or SLAVE")
@@ -1100,6 +1464,7 @@ class SDG2122X:
     # ---- Sampling, harmonics and waveform combination -------------------
 
     def sample_rate_status(self, channel: int) -> str:
+        self._require_feature("sample_rate", "SRATE")
         return self.query_channel(channel, "SRATE")
 
     def set_sample_rate(
@@ -1109,11 +1474,12 @@ class SDG2122X:
         mode: str | None = None,
         value: float | None = None,
     ) -> str:
+        profile = self._require_feature("sample_rate", "SRATE")
         parameters: list[tuple[str, Any]] = []
         if mode is not None:
             mode_value = mode.strip().upper()
             if mode_value not in {"DDS", "TARB"}:
-                raise ValueError("SDG2122X sample-rate mode must be DDS or TARB")
+                raise ValueError(f"{profile.model} sample-rate mode must be DDS or TARB")
             parameters.append(("MODE", mode_value))
         if value is not None:
             parameters.append(("VALUE", value))
@@ -1122,6 +1488,7 @@ class SDG2122X:
         return response
 
     def harmonic_status(self, channel: int) -> str:
+        self._require_feature("harmonic", "HARM")
         return self.query_channel(channel, "HARM")
 
     def set_harmonic(
@@ -1129,14 +1496,17 @@ class SDG2122X:
         channel: int,
         parameters: Mapping[str, Any] | Sequence[tuple[str, Any]],
     ) -> str:
+        self._require_feature("harmonic", "HARM")
         response = self.set_channel_parameters(channel, "HARM", parameters)
         assert response is not None
         return response
 
     def combine_status(self, channel: int) -> str:
+        self._require_feature("combine", "CMBN")
         return self.query_channel(channel, "CMBN")
 
     def set_combine(self, channel: int, enabled: bool) -> str:
+        self._require_feature("combine", "CMBN")
         validate_channel(channel)
         self.write(f"C{channel}:CMBN {'ON' if enabled else 'OFF'}")
         return self.combine_status(channel)
@@ -1144,11 +1514,13 @@ class SDG2122X:
     # ---- Frequency counter and protection -------------------------------
 
     def frequency_counter_status(self) -> str:
+        self._require_feature("frequency_counter", "FCNT")
         return self.query("FCNT?")
 
     def set_frequency_counter(
         self, parameters: Mapping[str, Any] | Sequence[tuple[str, Any]]
     ) -> str:
+        self._require_feature("frequency_counter", "FCNT")
         self.write(f"FCNT {scpi_pairs(parameters)}")
         return self.frequency_counter_status()
 
@@ -1194,8 +1566,11 @@ class SDG2122X:
 
     def set_language(self, language: str) -> str:
         value = language.strip().upper()
-        if value not in {"EN", "CH", "RU"}:
-            raise ValueError("Language must be EN, CH, or RU")
+        profile = self._ensure_model_profile()
+        if value not in profile.languages:
+            raise ValueError(
+                f"{profile.model} language must be one of {', '.join(profile.languages)}"
+            )
         self.write(f"LAGG {value}")
         return self.language()
 
@@ -1220,9 +1595,11 @@ class SDG2122X:
         self.write(f"SYST:TIME {value.strip()}")
 
     def set_power_on_mode(self, direct_power_on: bool) -> None:
+        self._require_feature("power_on_mode", "POWER:ON:MODE")
         self.write(f"POWER:ON:MODE {1 if direct_power_on else 2}")
 
     def set_front_panel_keys(self, enabled: bool) -> None:
+        self._require_feature("front_panel_keys", "KEY")
         self.write(f"KEY {'ON' if enabled else 'OFF'}")
 
     def buzzer_status(self) -> str:
@@ -1233,6 +1610,7 @@ class SDG2122X:
         return self.buzzer_status()
 
     def set_manual_trigger_coupling(self, enabled: bool) -> str:
+        self._require_feature("manual_trigger_coupling", "COUP TRDUCH")
         self.write(f"COUP TRDUCH,{'ON' if enabled else 'OFF'}")
         return self.coupling_status()
 
@@ -1291,6 +1669,9 @@ class SDG2122X:
 
     def reset(self) -> None:
         self.write("*RST")
+
+
+SiglentSDG = SDG2122X
 
 
 def print_lines(lines: Iterable[str]) -> None:
@@ -1966,9 +2347,14 @@ class SDGTerminalApp:
 
         connected = self.instrument.is_connected
         connection_text = f"{ANSI_GREEN}ONLINE{ANSI_RESET}" if connected else f"{ANSI_RED}OFFLINE{ANSI_RESET}"
+        model_text = (
+            self.instrument.model_profile.model
+            if connected and self.sdg_compatible
+            else "SCPI"
+        )
         header = (
             f"{ANSI_BLUE_BG}{ANSI_BOLD} SCPI TERMINAL CONTROL {ANSI_RESET} "
-            f"{connection_text}  {self.host}:{self.port}  当前 CH{self.channel}"
+            f"{connection_text}  {model_text}  {self.host}:{self.port}  当前 CH{self.channel}"
         )
         lines = [fit_display(header, width)]
 
@@ -2040,7 +2426,9 @@ class SDGTerminalApp:
                 fit_display(f"设备: {self.identity}", width),
                 fit_display("模式: 通用 SCPI（SIGLENT SDG 专用页已停用）", width),
             ]
-        summaries: list[str] = []
+        summaries: list[str] = [
+            fit_display(f"设备档案: {self.instrument.model_profile.summary()}", width)
+        ]
         for channel in (1, 2):
             wave = self.waveform[channel]
             output = self.output[channel]
@@ -2078,6 +2466,7 @@ class SDGTerminalApp:
                 f"幅度: {wave.get('AMP', '?')} / {wave.get('AMPVRMS', '?')}",
                 f"偏置: {wave.get('OFST', '?')}  相位: {wave.get('PHSE', '?')}",
                 f"输出: {output.get('STATE', '?')}  负载: {output.get('LOAD', '?')}",
+                f"型号: {self.instrument.model_profile.summary()}",
             ]
         )
         return (lines + [""] * height)[:height]
@@ -2610,7 +2999,7 @@ class SDGTerminalApp:
                     refresh=True,
                 )
 
-        return [
+        actions = [
             MenuAction("刷新通道状态", lambda: self._safe("刷新通道", lambda: self._refresh_channel(channel))),
             MenuAction("切换输出 ON/OFF", lambda: self._toggle_output(channel), output.get("STATE", "?")),
             MenuAction("波形类型 WVTP", lambda: self._set_basic_choice("WVTP", "波形类型", ("SINE", "SQUARE", "RAMP", "PULSE", "NOISE", "ARB", "DC")), wave.get("WVTP", "?")),
@@ -2641,6 +3030,13 @@ class SDGTerminalApp:
             MenuAction("采样模式 DDS/TARB", lambda: self._choose_then("采样模式", ("DDS", "TARB"), lambda value: self.instrument.set_sample_rate(channel, mode=value))),
             MenuAction("TrueArb 采样率", lambda: self._number_then("采样率 Sa/s", lambda value: self.instrument.set_sample_rate(channel, value=value))),
         ]
+        if not self.instrument.model_profile.supports("sample_rate"):
+            actions = [
+                action
+                for action in actions
+                if action.label not in {"采样模式 DDS/TARB", "TrueArb 采样率"}
+            ]
+        return actions
 
     def _modulation_actions(self) -> list[MenuAction]:
         channel = self.channel
@@ -2835,7 +3231,7 @@ class SDGTerminalApp:
             if response is not None:
                 self.show_text("波形数据", str(response))
 
-        return [
+        actions = [
             MenuAction("查询当前任意波", lambda: show_query("当前任意波", lambda: self.instrument.arbitrary_status(channel))),
             MenuAction("按索引选择内建任意波", select_index),
             MenuAction("按名称选择任意波", select_name),
@@ -2848,6 +3244,11 @@ class SDGTerminalApp:
             MenuAction("上传十六进制任意波", upload_hex, dangerous=True),
             MenuAction("读取用户任意波数据", query_wave_data),
         ]
+        if not self.instrument.model_profile.supports("arbitrary_marker"):
+            actions = [
+                action for action in actions if action.label != "任意波 Marker 开关"
+            ]
+        return actions
 
     def _advanced_actions(self) -> list[MenuAction]:
         channel = self.channel
@@ -2878,7 +3279,7 @@ class SDGTerminalApp:
                     return
             self._safe("设置多机同步", lambda: self.instrument.set_cascade(state == "ON", mode=mode, delay_s=delay))
 
-        return [
+        actions = [
             MenuAction("查询 SYNC", lambda: self._safe("SYNC", lambda: self.instrument.sync_status(channel))),
             MenuAction("切换 SYNC", lambda: self._toggle_channel_query("SYNC", lambda: self.instrument.sync_status(channel), lambda enabled: self.instrument.set_sync(channel, enabled))),
             MenuAction("两通道同相位 EQPHASE", lambda: self._safe("同相位", self.instrument.equal_phase)),
@@ -2906,6 +3307,13 @@ class SDGTerminalApp:
             MenuAction("查询多机同步", lambda: self._safe("多机同步", self.instrument.cascade_status)),
             MenuAction("设置多机同步", set_cascade),
         ]
+        if not self.instrument.model_profile.supports("cascade"):
+            actions = [
+                action
+                for action in actions
+                if action.label not in {"查询多机同步", "设置多机同步"}
+            ]
+        return actions
 
     def _system_actions(self) -> list[MenuAction]:
         channel = self.channel
@@ -2991,15 +3399,42 @@ class SDGTerminalApp:
                 self._safe("恢复默认设置", self.instrument.reset)
 
         def unsupported() -> None:
+            profile = self.instrument.model_profile
+            feature_names = {
+                "noise_add": "噪声叠加 NOISE_ADD",
+                "arbitrary_marker": "任意波 Marker MSW",
+                "sample_rate": "远程采样率 SRATE",
+                "cascade": "多机同步 CASCADE",
+                "manual_trigger_coupling": "手动触发双通道耦合 TRDUCH",
+                "power_on_mode": "上电开机模式 POWER:ON:MODE",
+                "front_panel_keys": "前面板按键开关 KEY",
+            }
+            unavailable = [
+                label
+                for feature, label in feature_names.items()
+                if not profile.supports(feature)
+            ]
+            limits = [
+                f"{waveform}: {format_frequency_limit(limit)}"
+                for waveform, limit in profile.frequency_limits_hz
+            ]
             self.show_text(
-                "本机型不支持的 SDG7000A 专属功能",
-                "序列波形、16 路数字通道、跳频 FHOP、SDG7000A 计数器统计命令、"
-                "SDG7000A 文件管理命令和部分 IQ/数字接口功能不属于 SDG2122X。\n"
-                "当前固件对 CURRPRT、VOLTSTAT 和任意波 Marker 查询也没有响应，因此仅保留在高级 API/原始 SCPI 中。\n\n"
-                "这些命令不会由 TUI 发送。需要实验性访问时可使用 SCPI 控制台，但设备通常会返回错误。",
+                f"{profile.model} 型号能力边界",
+                f"档案: {profile.summary()}\n\n"
+                + ("频率上限:\n- " + "\n- ".join(limits) + "\n\n" if limits else "")
+                + (
+                    "TUI/API 已停用的命令族:\n- "
+                    + "\n- ".join(unavailable)
+                    + "\n\n"
+                    if unavailable
+                    else ""
+                )
+                + "序列波形、16 路数字通道、FHOP、SDG7000A 计数器统计、"
+                "文件管理及 IQ/数字接口等平台专属功能也不会由 TUI 发送。\n\n"
+                "原始 SCPI 控制台不会绕过仪器自身校验，实验性命令请以目标固件手册为准。",
             )
 
-        return [
+        actions = [
             MenuAction("噪声叠加 NOISE_ADD", noise_add),
             MenuAction("查询频率计 FCNT", lambda: self._safe("频率计", self.instrument.frequency_counter_status)),
             MenuAction("频率计开关", lambda: set_counter_choice("STATE", "频率计开关", ("ON", "OFF"))),
@@ -3013,7 +3448,7 @@ class SDGTerminalApp:
             MenuAction("参考时钟源", lambda: self._choose_then("参考时钟", ("INT", "EXT"), self.instrument.set_clock_source, refresh=False)),
             MenuAction("10 MHz 时钟输出", set_clock_output),
             MenuAction("数字格式", lambda: self._choose_then("小数点格式", ("DOT", "COMMA"), lambda decimal: self.instrument.set_number_format(decimal, "SPACE"), refresh=False)),
-            MenuAction("系统语言", lambda: self._choose_then("系统语言", ("EN", "CH", "RU"), self.instrument.set_language, refresh=False)),
+            MenuAction("系统语言", lambda: self._choose_then("系统语言", self.instrument.model_profile.languages, self.instrument.set_language, refresh=False)),
             MenuAction("启动配置", lambda: self._choose_then("启动配置", ("DEFAULT", "LAST", "USER"), self.instrument.set_startup_config, refresh=False)),
             MenuAction("直接上电开机模式", lambda: self._choose_then("开机模式", ("直接上电", "按键开机"), lambda value: self.instrument.set_power_on_mode(value == "直接上电"), refresh=False)),
             MenuAction("前面板按键开关", lambda: self._choose_then("前面板按键", ("ON", "OFF"), lambda value: self.instrument.set_front_panel_keys(value == "ON"), refresh=False)),
@@ -3024,11 +3459,19 @@ class SDGTerminalApp:
             MenuAction("修改 IP 地址", lambda: set_network_value("ip", "IP 地址"), dangerous=True),
             MenuAction("修改子网掩码", lambda: set_network_value("mask", "子网掩码"), dangerous=True),
             MenuAction("修改网关", lambda: set_network_value("gateway", "网关"), dangerous=True),
-            MenuAction("两通道同时开启输出", lambda: self._safe("两通道输出 ON", lambda: self.instrument.write("OUT_BOTHCH ON")), dangerous=True),
-            MenuAction("两通道同时关闭输出", lambda: self._safe("两通道输出 OFF", lambda: self.instrument.write("OUT_BOTHCH OFF"))),
+            MenuAction("两通道同时开启输出", lambda: self._safe("两通道输出 ON", lambda: self.instrument.set_all_outputs(True), refresh=True), dangerous=True),
+            MenuAction("两通道同时关闭输出", lambda: self._safe("两通道输出 OFF", lambda: self.instrument.set_all_outputs(False), refresh=True)),
             MenuAction("恢复默认设置 (*RST)", reset_device, dangerous=True),
-            MenuAction("查看 SDG7000A 专属/不支持功能", unsupported),
+            MenuAction("查看当前型号能力边界", unsupported),
         ]
+        hidden_labels: set[str] = set()
+        if not self.instrument.model_profile.supports("noise_add"):
+            hidden_labels.add("噪声叠加 NOISE_ADD")
+        if not self.instrument.model_profile.supports("power_on_mode"):
+            hidden_labels.add("直接上电开机模式")
+        if not self.instrument.model_profile.supports("front_panel_keys"):
+            hidden_labels.add("前面板按键开关")
+        return [action for action in actions if action.label not in hidden_labels]
 
     def _console_actions(self) -> list[MenuAction]:
         def send_command() -> None:
@@ -3094,7 +3537,10 @@ class SDGTerminalApp:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Discover SCPI instruments and control SIGLENT SDG generators over TCP."
+        description=(
+            "Discover SCPI instruments and control profiled SIGLENT SDG generators "
+            "including SDG1032X and SDG2122X over TCP."
+        )
     )
     parser.add_argument(
         "--host",
@@ -3231,6 +3677,16 @@ def run(args: argparse.Namespace) -> int:
                             "model": candidate.model,
                             "serial": candidate.serial,
                             "siglent_sdg_compatible": is_siglent_sdg_identity(candidate.identity),
+                            "sdg_family": (
+                                get_sdg_model_profile(candidate.identity).family
+                                if get_sdg_model_profile(candidate.identity) is not None
+                                else None
+                            ),
+                            "max_sine_frequency_hz": (
+                                get_sdg_model_profile(candidate.identity).frequency_limit("SINE")
+                                if get_sdg_model_profile(candidate.identity) is not None
+                                else None
+                            ),
                         }
                         for candidate in candidates
                     ],
@@ -3309,6 +3765,7 @@ def run(args: argparse.Namespace) -> int:
         elif args.action == "status":
             channels = (1, 2) if args.channel == "all" else (int(args.channel),)
             print(f"Device: {identity}")
+            print(f"Profile: {instrument.model_profile.summary()}")
             for channel in channels:
                 waveform, output = instrument.channel_status(channel)
                 print(f"CH{channel} waveform: {waveform}")
